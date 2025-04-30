@@ -324,7 +324,7 @@ static void onic_clear_tx_queue(struct onic_private *priv, u16 qid)
 	onic_qdma_clear_tx_queue(priv->hw.qdma, qid);
 
 	ring = &q->ring;
-	real_count = ring->count - 1;
+	real_count = onic_ring_get_real_count(ring);
 	size = QDMA_H2C_ST_DESC_SIZE * real_count + QDMA_WB_STAT_SIZE;
 	size = ALIGN(size, PAGE_SIZE);
 
@@ -367,7 +367,7 @@ static int onic_init_tx_queue(struct onic_private *priv, u16 qid)
 
 	ring = &q->ring;
 	ring->count = onic_ring_count(rngcnt_idx);
-	real_count = ring->count - 1;
+	real_count = onic_ring_get_real_count(ring);
 
 	/* allocate DMA memory for TX descriptor ring */
 	size = QDMA_H2C_ST_DESC_SIZE * real_count + QDMA_WB_STAT_SIZE;
@@ -412,6 +412,7 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 {
 	struct onic_rx_queue *q = priv->rx_queue[qid];
 	struct onic_ring *ring;
+	struct net_device *dev = priv->netdev;
 	u32 size, real_count;
 	int i;
 
@@ -424,7 +425,7 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 	netif_napi_del(&q->napi);
 
 	ring = &q->desc_ring;
-	real_count = ring->count - 1;
+	real_count = onic_ring_get_real_count(ring);
 	size = QDMA_C2H_ST_DESC_SIZE * real_count + QDMA_WB_STAT_SIZE;
 	size = ALIGN(size, PAGE_SIZE);
 
@@ -433,7 +434,7 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 				  ring->dma_addr);
 
 	ring = &q->cmpl_ring;
-	real_count = ring->count - 1;
+	real_count = onic_ring_get_real_count(ring);
 	size = QDMA_C2H_CMPL_SIZE * real_count + QDMA_C2H_CMPL_STAT_SIZE;
 	size = ALIGN(size, PAGE_SIZE);
 
@@ -443,12 +444,26 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 
 	for (i = 0; i < real_count; ++i) {
 		struct page *pg = q->buffer[i].pg;
-		__free_pages(pg, 0);
+		page_pool_recycle_direct(q->ppool, pg);
 	}
+	netdev_info(dev, "Freed memory for %d pages ", real_count);
 
 	kfree(q->buffer);
+	kfree(q->pparam);
 	kfree(q);
 	priv->rx_queue[qid] = NULL;
+}
+
+void init_pparam(struct page_pool_params *pparams, struct onic_private *priv, const u8 desc_rngcnt_idx)
+{
+	pparams->order = 0;		// If order > 0, then multiple block of pages are requested per packet
+					// e.g. Jumbo packets can ask for order 2 = 4 pages for 9000B packets
+	//pparams->flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
+	pparams->flags = 0;	// If I ask the page pool API to do DMA mapping, it fails to allocate memory. Why?
+	pparams->pool_size = onic_ring_count(desc_rngcnt_idx);
+	pparams->nid = 0;
+	pparams->dev = &priv->netdev->dev;
+	pparams->dma_dir = DMA_FROM_DEVICE;
 }
 
 static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
@@ -461,6 +476,8 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	struct onic_rx_queue *q;
 	struct onic_ring *ring;
 	struct onic_qdma_c2h_param param;
+	struct page_pool_params *pparam;
+	struct page_pool *ppool;
 	u16 vid;
 	u32 size, real_count;
 	int i, rv;
@@ -475,13 +492,27 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	q = kzalloc(sizeof(struct onic_rx_queue), GFP_KERNEL);
 	if (!q)
 		return -ENOMEM;
-
+	
+	netdev_info(dev, "Allocated memory for onic_rx_queue ");
 	/* evenly assign to RX queues available vectors */
 	vid = qid % priv->num_q_vectors;
 
 	q->netdev = dev;
 	q->vector = priv->q_vector[vid];
 	q->qid = qid;
+
+	/* Setup per queue page pool */
+	pparam = kzalloc(sizeof(struct page_pool_params), GFP_KERNEL);
+	if (!pparam)
+		goto clear_rx_queue;
+
+	init_pparam(pparam, priv, desc_rngcnt_idx);
+	ppool = page_pool_create(pparam);	// Only ring is initialized, pages are not allocated yet.
+	if (!ppool)
+		goto clear_rx_queue;
+	q->ppool = ppool;
+	q->pparam = pparam;
+	netdev_info(dev, "page pool size, order onic_rx_queue %d %d ", q->pparam->pool_size, q->pparam->order);
 
 	/* allocate DMA memory for RX descriptor ring */
 	ring = &q->desc_ring;
@@ -496,6 +527,7 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 		rv = -ENOMEM;
 		goto clear_rx_queue;
 	}
+	netdev_info(dev, "Allocated memory for ring->desc ");
 	memset(ring->desc, 0, size);
 	ring->wb = ring->desc + QDMA_C2H_ST_DESC_SIZE * real_count;
 	ring->next_to_use = 0;
@@ -509,18 +541,20 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 		rv = -ENOMEM;
 		goto clear_rx_queue;
 	}
+	netdev_info(dev, "Allocated memory for q->buffer ");
 
 	for (i = 0; i < real_count; ++i) {
-		struct page *pg = dev_alloc_pages(0);
-
+		struct page *pg = page_pool_dev_alloc_pages(q->ppool);
 		if (!pg) {
 			rv = -ENOMEM;
 			goto clear_rx_queue;
 		}
+		//netdev_info(dev, "Allocated memory for page %d ", i);
 
 		q->buffer[i].pg = pg;
 		q->buffer[i].offset = 0;
 	}
+	netdev_info(dev, "Allocated memory for %d pages ", real_count);
 
 	/* map pages and initialize descriptors */
 	for (i = 0; i < real_count; ++i) {
@@ -549,6 +583,7 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 		rv = -ENOMEM;
 		goto clear_rx_queue;
 	}
+	netdev_info(dev, "Allocated memory for completion ring ");
 	memset(ring->desc, 0, size);
 	ring->wb = ring->desc + QDMA_C2H_CMPL_SIZE * real_count;
 	ring->next_to_use = 0;

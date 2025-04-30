@@ -68,15 +68,19 @@ struct onic_tx_queue {
 	struct onic_q_vector *vector;
 };
 
+/* Check cache line size */
 struct onic_rx_queue {
+	// 1st cache line
 	struct net_device *netdev;
 	u16 qid;
-
 	struct onic_rx_buffer *buffer;
-	struct onic_ring desc_ring;
+	struct onic_ring desc_ring;	//40 bytes
+	// 2nd cache line
 	struct onic_ring cmpl_ring;
 	struct onic_q_vector *vector;
-
+	struct page_pool *ppool;
+	struct page_pool_params *pparam;
+	// 3rd cache line
 	struct napi_struct napi;
 };
 
