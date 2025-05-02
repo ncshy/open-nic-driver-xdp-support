@@ -19,6 +19,7 @@
 
 #include <linux/netdevice.h>
 #include <linux/cpumask.h>
+#include <net/xdp.h>
 
 #include "onic_hardware.h"
 
@@ -44,6 +45,12 @@ struct onic_rx_buffer {
 	u64 time_stamp;
 };
 
+enum {
+	ONIC_XDP_PASS = 0,
+	ONIC_XDP_TX,
+	ONIC_XDP_REDIRECT,
+	ONIC_XDP_DROP
+};
 /**
  * struct onic_ring - generic ring structure
  **/
@@ -81,6 +88,8 @@ struct onic_rx_queue {
 	struct page_pool *ppool;
 	struct page_pool_params *pparam;
 	// 3rd cache line
+	struct xdp_rxq_info xdp_rxq;	//Internally cache aligned
+	// 4th cache line
 	struct napi_struct napi;
 };
 

@@ -107,6 +107,12 @@ static void onic_rx_refill(struct onic_rx_queue *q)
 	onic_set_rx_head(priv->hw.qdma, q->qid, ring->next_to_use);
 }
 
+
+static int onic_run_xdp(struct bpf_prog *xdp_prog, struct xdp_buff *xdpb) {
+	return ONIC_XDP_PASS;
+}
+
+
 static int onic_rx_poll(struct napi_struct *napi, int budget)
 {
 	struct onic_rx_queue *q =
@@ -125,6 +131,9 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	bool napi_cmpl_rval = 0;
 	bool flipped = 0;
 	bool debug = 0;
+	struct xdp_buff xdpb;
+	struct bpf_prog *xdp_prog = NULL;
+	int xdp_ret;
 
 	for (i = 0; i < priv->num_tx_queues; i++)
 		onic_tx_clean(priv->tx_queue[i]);
@@ -181,23 +190,47 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		struct onic_rx_buffer *buf =
 			&q->buffer[desc_ring->next_to_clean];
 		struct sk_buff *skb;
-		int len = cmpl.pkt_len;
 		u8 *data;
-		skb = napi_alloc_skb(napi, len);
-		if (!skb) {
-			rv = -ENOMEM;
-			break;
-		}
+		u8 *page;
+		int len = cmpl.pkt_len;
 		/* maximum packet size is 1514, less than the page size */
-		data = (u8 *)(page_address(buf->pg) + buf->offset);
-		skb_put_data(skb, data, len);
-		skb->protocol = eth_type_trans(skb, q->netdev);
-		skb->ip_summed = CHECKSUM_NONE;
-		skb_record_rx_queue(skb, qid);
-		rv = napi_gro_receive(napi, skb);
-		if (rv < 0) {
-			netdev_err(q->netdev, "napi_gro_receive, err = %d", rv);
-			break;
+
+		page = (u8 *)page_address(buf->pg);
+		data = (u8 *)(page + buf->offset);
+
+		xdpb.data_hard_start = page;
+		xdpb.data = xdpb.data_hard_start + XDP_PACKET_HEADROOM;
+		xdpb.data_end = xdpb.data + len;
+		xdpb.rxq = &q->xdp_rxq;
+
+		xdp_ret = onic_run_xdp(xdp_prog, &xdpb);
+		if ( xdp_ret == ONIC_XDP_PASS ) {
+
+			skb = napi_alloc_skb(napi, len);
+			if (!skb) {
+				rv = -ENOMEM;
+				break;
+			}
+
+			skb_put_data(skb, data, len);
+			skb->protocol = eth_type_trans(skb, q->netdev);
+			skb->ip_summed = CHECKSUM_NONE;
+			/*
+
+			skb = build_skb(xdpb.data, PAGE_SIZE);		// Needs space at tail for struct skb_shared_info, handled through pparams->max_len
+			page_pool_release_page(q->ppool, (struct page *)page);	// Disconnect page from page pool, to allow for regular page usage
+			*/
+			skb_record_rx_queue(skb, qid);
+			page_pool_put_page(q->ppool, (struct page *)page, PAGE_SIZE, 0);	// Return page to page pool
+
+			rv = napi_gro_receive(napi, skb);
+			if (rv < 0) {
+				netdev_err(q->netdev, "napi_gro_receive, err = %d", rv);
+				break;
+			}
+		} else if (xdp_ret == ONIC_XDP_DROP) {
+			netdev_err(q->netdev, "Dropped a packet");
+			page_pool_put_page(q->ppool, (struct page *)page, PAGE_SIZE, 0);	// Return page to page pool
 		}
 		priv->netdev_stats.rx_packets++;
 		priv->netdev_stats.rx_bytes += len;
@@ -449,7 +482,14 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 	netdev_info(dev, "Freed memory for %d pages ", real_count);
 
 	kfree(q->buffer);
-	kfree(q->pparam);
+
+	xdp_rxq_info_unreg_mem_model(&q->xdp_rxq);
+	if(xdp_rxq_info_is_reg(&q->xdp_rxq)) 
+		xdp_rxq_info_unreg(&q->xdp_rxq);
+
+
+	if (q->pparam)
+		kfree(q->pparam);
 	kfree(q);
 	priv->rx_queue[qid] = NULL;
 }
@@ -463,7 +503,9 @@ void init_pparam(struct page_pool_params *pparams, struct onic_private *priv, co
 	pparams->pool_size = onic_ring_count(desc_rngcnt_idx);
 	pparams->nid = 0;
 	pparams->dev = &priv->netdev->dev;
+	pparams->offset = XDP_PACKET_HEADROOM;
 	pparams->dma_dir = DMA_FROM_DEVICE;
+	//pparams->max_len = PAGE_SIZE - SKB_DATA_ALIGN(sizeof(struct skb_shared_info) + XDP_PACKET_HEADROOM);	//To align with build_skb() call
 }
 
 static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
@@ -481,6 +523,7 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	u16 vid;
 	u32 size, real_count;
 	int i, rv;
+	int err;
 	bool debug = 0;
 
 	if (priv->rx_queue[qid]) {
@@ -512,6 +555,19 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 		goto clear_rx_queue;
 	q->ppool = ppool;
 	q->pparam = pparam;
+
+	err = xdp_rxq_info_reg(&q->xdp_rxq, q->netdev, q->qid, 0);
+	if (err) {
+		netdev_info(dev, "Failed to register device and queue for xdp");
+		goto clear_rx_queue;
+	}
+
+	err = xdp_rxq_info_reg_mem_model(&q->xdp_rxq, MEM_TYPE_PAGE_POOL, q->ppool);
+	if (err) {
+		netdev_info(dev, "Failed to register driver memory model with xdp");
+		goto clear_rx_queue;
+	}
+
 	netdev_info(dev, "page pool size, order onic_rx_queue %d %d ", q->pparam->pool_size, q->pparam->order);
 
 	/* allocate DMA memory for RX descriptor ring */
@@ -626,6 +682,7 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 
 clear_rx_queue:
 	onic_clear_rx_queue(priv, qid);
+
 	return rv;
 }
 
