@@ -131,6 +131,7 @@ static const struct net_device_ops onic_netdev_ops = {
 	.ndo_do_ioctl = onic_do_ioctl,
 	.ndo_change_mtu = onic_change_mtu,
 	.ndo_get_stats64 = onic_get_stats64,
+	.ndo_bpf = onic_xdp,
 };
 
 extern void onic_set_ethtool_ops(struct net_device *netdev);

@@ -132,7 +132,6 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	bool flipped = 0;
 	bool debug = 0;
 	struct xdp_buff xdpb;
-	struct bpf_prog *xdp_prog = NULL;
 	int xdp_ret;
 
 	for (i = 0; i < priv->num_tx_queues; i++)
@@ -203,9 +202,11 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		xdpb.data_end = xdpb.data + len;
 		xdpb.rxq = &q->xdp_rxq;
 
-		xdp_ret = onic_run_xdp(xdp_prog, &xdpb);
+		xdp_ret = onic_run_xdp(priv->prog, &xdpb);
 		if ( xdp_ret == ONIC_XDP_PASS ) {
 
+			priv->xdp_stats.xdp_passed++;
+			netdev_info(q->netdev, "xdp_passed: %llu\n", priv->xdp_stats.xdp_passed);
 			skb = napi_alloc_skb(napi, len);
 			if (!skb) {
 				rv = -ENOMEM;
@@ -229,7 +230,8 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 				break;
 			}
 		} else if (xdp_ret == ONIC_XDP_DROP) {
-			netdev_err(q->netdev, "Dropped a packet");
+			priv->xdp_stats.xdp_dropped++;
+			netdev_info(q->netdev, "xdp_dropped: %llu\n", priv->xdp_stats.xdp_dropped);
 			page_pool_put_page(q->ppool, (struct page *)page, PAGE_SIZE, 0);	// Return page to page pool
 		}
 		priv->netdev_stats.rx_packets++;
@@ -484,7 +486,7 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 	kfree(q->buffer);
 
 	xdp_rxq_info_unreg_mem_model(&q->xdp_rxq);
-	if(xdp_rxq_info_is_reg(&q->xdp_rxq)) 
+	if(xdp_rxq_info_is_reg(&q->xdp_rxq))
 		xdp_rxq_info_unreg(&q->xdp_rxq);
 
 
@@ -494,7 +496,43 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 	priv->rx_queue[qid] = NULL;
 }
 
-void init_pparam(struct page_pool_params *pparams, struct onic_private *priv, const u8 desc_rngcnt_idx)
+static int onic_xdp_setup(struct net_device *dev, struct bpf_prog *prog, struct netlink_ext_ack *extack)
+//extack is a mechanism to communicate with the user space via netlink
+{
+	int running, need_update;
+	struct onic_private *priv = netdev_priv(dev);
+	struct bpf_prog *old_prog;
+
+	if (prog && (dev->mtu > ONIC_MAX_QDMA_BUF_SIZE)) {
+		NL_SET_ERR_MSG_MOD(extack, "Program does not support XDP fragments\n"); //*_MOD() includes module name in error message
+		return -EOPNOTSUPP;
+	}
+
+	need_update = !!priv->prog != !!prog;
+	if (need_update) {
+		running = netif_running(dev);
+		if (running)
+			onic_stop_netdev(dev);
+		old_prog = xchg(&priv->prog, prog);
+		if (old_prog)
+			bpf_prog_put(old_prog);	//Needs to be bpf_prog_put since driver owns old_prog 
+		if (running)
+			onic_open_netdev(dev);
+	}
+	return 0;
+}
+
+int onic_xdp(struct net_device *dev, struct netdev_bpf *bpf)
+{
+	switch(bpf->command) {
+	case XDP_SETUP_PROG:
+		return onic_xdp_setup(dev, bpf->prog, bpf->extack);
+	default:
+		return -EINVAL;
+	}
+}
+
+static void init_pparam(struct page_pool_params *pparams, struct onic_private *priv, const u8 desc_rngcnt_idx)
 {
 	pparams->order = 0;		// If order > 0, then multiple block of pages are requested per packet
 					// e.g. Jumbo packets can ask for order 2 = 4 pages for 9000B packets
@@ -535,7 +573,7 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	q = kzalloc(sizeof(struct onic_rx_queue), GFP_KERNEL);
 	if (!q)
 		return -ENOMEM;
-	
+
 	netdev_info(dev, "Allocated memory for onic_rx_queue ");
 	/* evenly assign to RX queues available vectors */
 	vid = qid % priv->num_q_vectors;

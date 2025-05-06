@@ -24,7 +24,7 @@
 #include "onic_hardware.h"
 
 #define ONIC_MAX_QUEUES			64
-
+#define ONIC_MAX_QDMA_BUF_SIZE		PAGE_SIZE - XDP_PACKET_HEADROOM
 /* state bits */
 #define ONIC_ERROR_INTR			0
 #define ONIC_USER_INTR			1
@@ -100,6 +100,13 @@ struct onic_q_vector {
 	int numa_node;
 };
 
+struct onic_xdp_stats {
+	u64 xdp_passed;
+	u64 xdp_dropped;
+	u64 xdp_redirected;
+	u64 xdp_txed;
+};
+
 /**
  * struct onic_private - OpenNIC driver private data
  **/
@@ -126,6 +133,8 @@ struct onic_private {
 	struct onic_rx_queue *rx_queue[ONIC_MAX_QUEUES];
 
 	struct onic_hardware hw;
+	struct bpf_prog *prog;
+	struct onic_xdp_stats xdp_stats; // Make it per cpu to avoid contention
 };
 
 #endif
