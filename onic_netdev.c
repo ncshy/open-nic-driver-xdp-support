@@ -18,6 +18,7 @@
 #include <linux/pci.h>
 #include <linux/etherdevice.h>
 #include <linux/netdevice.h>
+#include <linux/filter.h>
 
 #include "onic_netdev.h"
 #include "qdma_access/qdma_register.h"
@@ -109,7 +110,18 @@ static void onic_rx_refill(struct onic_rx_queue *q)
 
 
 static int onic_run_xdp(struct bpf_prog *xdp_prog, struct xdp_buff *xdpb) {
-	return ONIC_XDP_PASS;
+	int act;
+
+	act = bpf_prog_run_xdp(xdp_prog, xdpb);
+
+	if (act == XDP_PASS)
+		return ONIC_XDP_PASS;
+	else if (act == XDP_TX)
+		return ONIC_XDP_TX;
+	else if (act == XDP_REDIRECT)
+		return ONIC_XDP_REDIRECT;
+	else
+		return ONIC_XDP_DROP;
 }
 
 
@@ -132,7 +144,6 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	bool flipped = 0;
 	bool debug = 0;
 	struct xdp_buff xdpb;
-	int xdp_ret;
 
 	for (i = 0; i < priv->num_tx_queues; i++)
 		onic_tx_clean(priv->tx_queue[i]);
@@ -192,6 +203,7 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		u8 *data;
 		u8 *page;
 		int len = cmpl.pkt_len;
+		int xdp_ret = ONIC_XDP_PASS;
 		/* maximum packet size is 1514, less than the page size */
 
 		page = (u8 *)page_address(buf->pg);
@@ -201,12 +213,12 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		xdpb.data = xdpb.data_hard_start + XDP_PACKET_HEADROOM;
 		xdpb.data_end = xdpb.data + len;
 		xdpb.rxq = &q->xdp_rxq;
-
-		xdp_ret = onic_run_xdp(priv->prog, &xdpb);
+		if (priv->prog)
+			xdp_ret = onic_run_xdp(priv->prog, &xdpb);
 		if ( xdp_ret == ONIC_XDP_PASS ) {
 
-			priv->xdp_stats.xdp_passed++;
-			netdev_info(q->netdev, "xdp_passed: %llu\n", priv->xdp_stats.xdp_passed);
+			if (priv->prog)
+				priv->xdp_stats.xdp_passed++;
 			skb = napi_alloc_skb(napi, len);
 			if (!skb) {
 				rv = -ENOMEM;
