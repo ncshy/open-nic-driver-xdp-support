@@ -32,10 +32,17 @@
 /* flag bits */
 #define ONIC_FLAG_MASTER_PF		0
 
+
+#define ONIC_SKB_BUFF 0
+#define ONIC_XDP_FRAME 1
 struct onic_tx_buffer {
-	struct sk_buff *skb;
+	union {
+		struct sk_buff *skb;
+		struct xdp_frame *xdpf;
+	};
 	dma_addr_t dma_addr;
 	u32 len;
+	u32 type;
 	u64 time_stamp;
 };
 
@@ -105,6 +112,8 @@ struct onic_xdp_stats {
 	u64 xdp_dropped;
 	u64 xdp_redirected;
 	u64 xdp_txed;
+	u64 xdp_tx_dropped;
+	u64 xdp_tx_errors;
 };
 
 /**

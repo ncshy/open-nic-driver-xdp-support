@@ -73,11 +73,15 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 
 	for (i = 0; i < work; ++i) {
 		struct onic_tx_buffer *buf = &q->buffer[ring->next_to_clean];
-		struct sk_buff *skb = buf->skb;
-
 		dma_unmap_single(&priv->pdev->dev, buf->dma_addr, buf->len,
 				 DMA_TO_DEVICE);
-		dev_kfree_skb_any(skb);
+		if (buf->type == ONIC_SKB_BUFF) {
+			struct sk_buff *skb = buf->skb;
+			dev_kfree_skb_any(skb);
+		} else if (buf->type == ONIC_XDP_FRAME) {
+			struct xdp_frame *xdpf = buf->xdpf;
+			xdp_return_frame_rx_napi(xdpf);
+		}
 
 		onic_ring_increment_tail(ring);
 	}
@@ -144,6 +148,7 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	bool flipped = 0;
 	bool debug = 0;
 	struct xdp_buff xdpb;
+	struct xdp_frame xdpf;
 
 	for (i = 0; i < priv->num_tx_queues; i++)
 		onic_tx_clean(priv->tx_queue[i]);
@@ -245,6 +250,15 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 			priv->xdp_stats.xdp_dropped++;
 			netdev_info(q->netdev, "xdp_dropped: %llu\n", priv->xdp_stats.xdp_dropped);
 			page_pool_put_page(q->ppool, (struct page *)page, PAGE_SIZE, 0);	// Return page to page pool
+		} else if (xdp_ret == ONIC_XDP_TX) {
+			int ret  = xdp_update_frame_from_buff(&xdpb, &xdpf);
+			if (ret < 0) {
+				priv->xdp_stats.xdp_tx_dropped++;
+				page_pool_put_page(q->ppool, (struct page *)page, PAGE_SIZE, 0);	// Return page to page pool
+				netdev_info(q->netdev, "Could not convert from xdp_buf to xdp_frmae\n");
+			} else {
+				onic_xmit_xdp_frame(&xdpf, q->netdev, qid);
+			}
 		}
 		priv->netdev_stats.rx_packets++;
 		priv->netdev_stats.rx_bytes += len;
@@ -855,6 +869,7 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 		dev_kfree_skb(skb);
 		priv->netdev_stats.tx_dropped++;
 		priv->netdev_stats.tx_errors++;
+		/* Why is this returing TX_OK when it has failed ? */
 		return NETDEV_TX_OK;
 	}
 
@@ -867,6 +882,7 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 	q->buffer[ring->next_to_use].skb = skb;
 	q->buffer[ring->next_to_use].dma_addr = dma_addr;
 	q->buffer[ring->next_to_use].len = skb->len;
+	q->buffer[ring->next_to_use].type = ONIC_SKB_BUFF;
 
 	priv->netdev_stats.tx_packets++;
 	priv->netdev_stats.tx_bytes += skb->len;
@@ -887,6 +903,69 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 	}
 
 	return NETDEV_TX_OK;
+}
+
+int onic_xmit_xdp_frame(struct xdp_frame *xdpf, struct net_device *dev, int rx_qid)
+{
+	struct onic_private *priv = netdev_priv(dev);
+	struct onic_tx_queue *q;
+	struct onic_ring *ring;
+	struct netdev_queue *nq;
+	struct page *page = virt_to_page(xdpf->data);
+	struct qdma_h2c_st_desc desc;
+	u16 qid = rx_qid;
+	dma_addr_t dma_addr;
+	u8 *desc_ptr;
+	bool debug = 0;
+
+	q = priv->tx_queue[qid];
+	nq = netdev_get_tx_queue(dev, qid);
+	__netif_tx_lock(nq, raw_smp_processor_id());
+	ring = &q->ring;
+
+	onic_tx_clean(q);
+
+	if (onic_ring_full(ring)) {
+		if (debug)
+			netdev_info(dev, "ring is full");
+		xdp_return_frame_rx_napi(xdpf);	
+		__netif_tx_unlock(nq);
+		return -1;
+	}
+	/* How does XDP frame ensure min length of 64 Bytes ? */
+	dma_addr = page_pool_get_dma_addr(page) + sizeof(*xdpf) + xdpf->headroom;
+	dma_sync_single_for_device(&priv->pdev->dev, dma_addr, xdpf->len,
+				  DMA_TO_DEVICE);
+
+	desc_ptr = ring->desc + QDMA_H2C_ST_DESC_SIZE * ring->next_to_use;
+	desc.len = xdpf->len;
+	desc.src_addr = dma_addr;
+	desc.metadata = xdpf->len;
+	qdma_pack_h2c_st_desc(desc_ptr, &desc);
+
+	q->buffer[ring->next_to_use].xdpf = xdpf;
+	q->buffer[ring->next_to_use].dma_addr = dma_addr;
+	q->buffer[ring->next_to_use].len = xdpf->len;
+	q->buffer[ring->next_to_use].type = ONIC_XDP_FRAME;
+
+	priv->xdp_stats.xdp_txed++;
+
+	onic_ring_increment_head(ring);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
+	if (onic_ring_full(ring) || !netdev_xmit_more()) {
+#elif defined(RHEL_RELEASE_CODE) 
+#if RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(8, 1)
+        if (onic_ring_full(ring) || !netdev_xmit_more()) {
+#endif
+#else
+	if (onic_ring_full(ring) || !skb->xmit_more) {
+#endif
+		wmb();
+		onic_set_tx_head(priv->hw.qdma, qid, ring->next_to_use);
+	}
+	__netif_tx_unlock(nq);
+	return 0;
 }
 
 int onic_set_mac_address(struct net_device *dev, void *addr)

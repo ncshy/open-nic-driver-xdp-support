@@ -39,6 +39,8 @@ int onic_stop_netdev(struct net_device *dev);
 
 netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev);
 
+int onic_xmit_xdp_frame(struct xdp_frame *xdpf, struct net_device *dev, int qid);
+
 int onic_set_mac_address(struct net_device *dev, void *addr);
 
 int onic_do_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd);
