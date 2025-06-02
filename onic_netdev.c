@@ -81,6 +81,7 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 		} else if (buf->type == ONIC_XDP_FRAME) {
 			struct xdp_frame *xdpf = buf->xdpf;
 			xdp_return_frame_rx_napi(xdpf);
+			kfree(xdpf);
 		}
 
 		onic_ring_increment_tail(ring);
@@ -148,7 +149,6 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	bool flipped = 0;
 	bool debug = 0;
 	struct xdp_buff xdpb;
-	struct xdp_frame xdpf;
 
 	for (i = 0; i < priv->num_tx_queues; i++)
 		onic_tx_clean(priv->tx_queue[i]);
@@ -215,8 +215,9 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		data = (u8 *)(page + buf->offset);
 
 		xdpb.data_hard_start = page;
-		xdpb.data = xdpb.data_hard_start + XDP_PACKET_HEADROOM;
+		xdpb.data = page + buf->offset;
 		xdpb.data_end = xdpb.data + len;
+		xdpb.frame_sz = PAGE_SIZE;
 		xdpb.rxq = &q->xdp_rxq;
 		if (priv->prog)
 			xdp_ret = onic_run_xdp(priv->prog, &xdpb);
@@ -251,13 +252,21 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 			netdev_info(q->netdev, "xdp_dropped: %llu\n", priv->xdp_stats.xdp_dropped);
 			page_pool_put_page(q->ppool, (struct page *)page, PAGE_SIZE, 0);	// Return page to page pool
 		} else if (xdp_ret == ONIC_XDP_TX) {
-			int ret  = xdp_update_frame_from_buff(&xdpb, &xdpf);
-			if (ret < 0) {
+			int ret;
+			struct xdp_frame *xdpf;
+			xdpf = kzalloc(sizeof(*xdpf), GFP_ATOMIC);
+			if (!xdpf) {
 				priv->xdp_stats.xdp_tx_dropped++;
 				page_pool_put_page(q->ppool, (struct page *)page, PAGE_SIZE, 0);	// Return page to page pool
-				netdev_info(q->netdev, "Could not convert from xdp_buf to xdp_frmae\n");
 			} else {
-				onic_xmit_xdp_frame(&xdpf, q->netdev, qid);
+				ret  = xdp_update_frame_from_buff(&xdpb, xdpf);
+				if (ret < 0) {
+					priv->xdp_stats.xdp_tx_dropped++;
+					page_pool_put_page(q->ppool, (struct page *)page, PAGE_SIZE, 0);	// Return page to page pool
+					kfree(xdpf);
+				} else {
+					onic_xmit_xdp_frame(xdpf, q->netdev, qid);
+				}
 			}
 		}
 		priv->netdev_stats.rx_packets++;
@@ -568,8 +577,8 @@ static void init_pparam(struct page_pool_params *pparams, struct onic_private *p
 	pparams->nid = 0;
 	pparams->dev = &priv->netdev->dev;
 	pparams->offset = XDP_PACKET_HEADROOM;
-	pparams->dma_dir = DMA_FROM_DEVICE;
-	//pparams->max_len = PAGE_SIZE - SKB_DATA_ALIGN(sizeof(struct skb_shared_info) + XDP_PACKET_HEADROOM);	//To align with build_skb() call
+	pparams->dma_dir = DMA_BIDIRECTIONAL;
+	pparams->max_len = PAGE_SIZE - (SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) + pparams->offset);	//To align with build_skb() call
 }
 
 static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
@@ -672,7 +681,7 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 		//netdev_info(dev, "Allocated memory for page %d ", i);
 
 		q->buffer[i].pg = pg;
-		q->buffer[i].offset = 0;
+		q->buffer[i].offset = q->pparam->offset;
 	}
 	netdev_info(dev, "Allocated memory for %d pages ", real_count);
 
@@ -933,9 +942,9 @@ int onic_xmit_xdp_frame(struct xdp_frame *xdpf, struct net_device *dev, int rx_q
 		return -1;
 	}
 	/* How does XDP frame ensure min length of 64 Bytes ? */
-	dma_addr = page_pool_get_dma_addr(page) + sizeof(*xdpf) + xdpf->headroom;
+	dma_addr = page_pool_get_dma_addr(page + sizeof(*xdpf) + xdpf->headroom);
 	dma_sync_single_for_device(&priv->pdev->dev, dma_addr, xdpf->len,
-				  DMA_TO_DEVICE);
+				  DMA_BIDIRECTIONAL);
 
 	desc_ptr = ring->desc + QDMA_H2C_ST_DESC_SIZE * ring->next_to_use;
 	desc.len = xdpf->len;
@@ -949,6 +958,7 @@ int onic_xmit_xdp_frame(struct xdp_frame *xdpf, struct net_device *dev, int rx_q
 	q->buffer[ring->next_to_use].type = ONIC_XDP_FRAME;
 
 	priv->xdp_stats.xdp_txed++;
+	netdev_info(dev, "XDP txed = %llu", priv->xdp_stats.xdp_txed);
 
 	onic_ring_increment_head(ring);
 
