@@ -942,7 +942,7 @@ int onic_xmit_xdp_frame(struct xdp_frame *xdpf, struct net_device *dev, int rx_q
 		return -1;
 	}
 	/* How does XDP frame ensure min length of 64 Bytes ? */
-	dma_addr = page_pool_get_dma_addr(page + sizeof(*xdpf) + xdpf->headroom);
+	dma_addr = page_pool_get_dma_addr(page) + sizeof(*xdpf) + xdpf->headroom;
 	dma_sync_single_for_device(&priv->pdev->dev, dma_addr, xdpf->len,
 				  DMA_BIDIRECTIONAL);
 
